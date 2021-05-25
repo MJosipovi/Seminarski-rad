@@ -1,0 +1,293 @@
+1  	//smanjen treptaj numerickog
+2  	#include "mbed.h"
+3  	#include "TextLCD.h"
+4  
+5  	//SHIFT registar
+6  	DigitalOut data(D10);
+7  	//OE se ne koristi
+8  	DigitalOut RCLK(D9);
+9  	DigitalOut SRCLK(D8);
+10 	//SRCLRn se ne koristi                   
+11 
+12 	BusOut segme(D7, D6, D5, D4); //segmenti numerickog LCD-a
+13 
+14 	DigitalOut BUZZ(D2); //buzzer za alarm
+15 	DigitalOut snooze(D3); //gumb za prekidanje alarma
+16 
+17 					//D11,  D12,  D13,  A2 po Arduino header-u  
+18 	SPISlave spi_port(PA_7, PA_6, PA_5, PA_4); //MOSI, MISO, SCLK, SS //SPI prema ESP32
+19 	I2C SHT3X(D14, D15); //SDA, SCL //I2C za senzor SHT30
+20 	Serial pc(USBTX, USBRX); //komunikacija prema PC-u
+21 	I2C i2c_lcd(I2C_SDA, I2C_SCL); //SDA, SCL //I2C setup za LCD16x2
+22 
+23 
+24 	struct tm  ts;
+25 	int second, minute, hour, day, month, year;
+26 	time_t seconds;
+27 
+28
+29 	//ovo saljemo na shift registar koji onda pali dijelove segmenta koje smo oznacili s logickom 1
+30 	//idu po redu, broj 0, broj 1, broj 2....broj 9
+31 	const int array_data[] = {0b00111111, 0b00000110, 0b01011011, 0b01001111, 0b01100110, 0b01101101, 0b01111101, 0b00000111, 0b01111111, 0b01101111};
+32 
+33 	//podaci s ESP32
+34 	long SPI_array[6]={}; //ima 5 cjelina --> temp_morn, temp_day, temp_eve, weather_id, Alarm_EPOCH, Time_EPOCH
+35 
+36 	//podaci s SHT30
+37 	int temp, hum; //temperatura(°C) i vlaznost(%)
+38 
+39 	//LCD16x2
+40 	TextLCD_I2C lcd(&i2c_lcd, 0x4E, TextLCD::LCD16x2); //2C bus, PCF8574 Slaveaddress, LCD Type
+41 
+42 	//Moguci vremenski uvjeti
+43 	char arr[20][30] = {
+44 		"No info","Storm", "Drizzle", "Rain", "Snow",
+45 		"Mist", "Smoke", "Haze", "Dust", "Fog",
+46 		"Sand", "Ash", "Haze", "Squall", "Tornado",
+47 		"Clear", "Clouds"
+48 	};
+49 
+50 	char day_state[3][4] = {"MOR","DAY","EVE"}; //Prikazujemo 3 prognozirane temperature
+51 
+52 	char stupnjevi=0b11011111; //kod za LCD za prikaz "°" kod prikaza temperature
+53 	bool trg = 0, info=0; //pomocne varijable
+54 
+55 	int izmjena=0;
+56 	void display_main(void);
+57 	void update_date(void);
+58 
+59 	//funkcija koja prima broj koji je potrebno prikazati i koji segment upaliti
+60 	void prikaz(char podaci, char segx){
+61 		int out=0;
+62 		
+63 		//saljemo 8 bit podatak na shift registar osnovnom serijskom komunikacijom
+64 		for(int i=7;i>=0;i--){
+65 			out=podaci>>i & 0b00000001; //kako se petlja vrti izoliramo jedan po jedan podatak
+66 			data=out; //postavimo podatak na pin
+67 			wait_us(1);
+68 			SRCLK=1; //obavijestimo shift registar da je podatak postavljen
+69 			wait_us(1);
+70 			SRCLK=0; //spustimo obavijest da odemo na sljedeci podatak
+71 			out=0;
+72 		}
+73 		
+74 		//jednom kada smo prenjeli kompletan podatak na shift registar ukljucujemo
+75 		//izlaze registra kako bi nam se podatak prikazao na numerickom ekranu
+76 		RCLK=1; //clock za storage
+77 		segme=segx; //paljenje segmenta numerickog ekrana
+78 		
+79 		izmjena++;
+80 		if(izmjena == 2000){ //otprilike 10 sekundi (2000*5*10^-3)
+81 			display_main(); //osvjezavanje LCD-a
+82 			izmjena = 0; //resetiranje brojaca 
+83 		}else{
+84 			wait_us(4950); //cekanje prije novog osvjezavanja numerickog ekrana
+85 		}
+86 		
+87 		RCLK=0; //micanje podatka s izlaza shift registra
+88 	} 
+89 
+90 	//pretvorba EPOCH u "normalno" vrijeme
+91 	void EPOCH_and_ALARM(void){
+92 		time_t seconds = time(NULL);
+93 		
+94 		char second_S[3]; //ss
+95 		char minute_S[3]; //mm
+96 		char hour_S[3]; //hh
+97 		char day_S[3]; //DD
+98 		char month_S[3]; //MM
+99 		char year_S[3]; //YY
+100		
+101		strftime(second_S, 3, "%S\n\r", localtime(&seconds));
+102		strftime(minute_S, 3, "%M\n\r", localtime(&seconds));
+103		strftime(hour_S, 3, "%H\n\r", localtime(&seconds));
+104		strftime(day_S, 3, "%d\n\r", localtime(&seconds));
+105		strftime(month_S, 3, "%m\n\r", localtime(&seconds));
+106		strftime(year_S, 3, "%y\n\r", localtime(&seconds));
+107		
+108		//naredba atoi nam sluzi za pretvorbu iz stringa (char) u int
+109		second = atoi(second_S);
+110		minute = atoi(minute_S);
+111		hour = atoi(hour_S);
+112		day = atoi(day_S);
+113		month = atoi(month_S);
+114		year = atoi(year_S);
+118		
+119		//ALARM //u slucaju da nitko ne prekine alarm (gumbom) on ce se sam zgasiti nakon 200 sekundi
+121		
+122		if(snooze == 1){ //gasenje alarma preko gumba
+123			SPI_array[4]=0;
+124			trajanje = 0;
+125			}
+126			
+127		//alarm se moze upaliti jedino ako je vrijednost EPOCH alarma veca od trenutnog EPOCH-a ali u 
+128		//isto vrijeme i manja od alarma+200 sekundi (trajanje alarma)
+129		//da bi se izbjegao alarm prilikom paljenja sustava (kada su sve varijable nula) i resetiranja gumbom
+130		//dodano je da EPOCH alarma mora biti razlicit od nule
+131		if(seconds>=SPI_array[4] && seconds<=trajanje && SPI_array[4] != 0){
+132			BUZZ=!BUZZ;
+133			
+134		}else{
+135			BUZZ=0;
+136		}
+137	}
+138
+139	//zove funkciju koja gura podatke u shift registar i pali korespondirajuci segment
+140	void urica(void){
+141		EPOCH_and_ALARM(); //refresh podataka za prikaz vremena
+142		prikaz(array_data[hour/10], 0b0111); //racunica i guranje serijom u registar
+143		prikaz(array_data[hour%10], 0b1011); //racunica i guranje serijom u registar
+144		prikaz(array_data[minute/10], 0b1101); //racunica i guranje serijom u registar
+145		prikaz(array_data[minute%10], 0b1110); //racunica i guranje serijom u registar
+146	}
+147
+148	void SHT30(void){
+149		int adr=0x44; //za SHT3x adresa je 0x44 ako je GND ili 0x45 ako je 3.3V
+150		char podaci[2]= {0x2C, 0x10};
+151		char data[6]= {};
+152		int chk, pass=0; //varijable check (od I2C), temperatura i vlaznost
+153		
+154		do{
+155			chk = SHT3X.write(adr<<1, podaci, 2, true);
+156			//pc.printf("chk:%d pass:%d\n\r", chk, pass);
+157			if(pass != 0){
+158				wait(3);
+159				pass++;
+160			}else{
+161				pass++;
+162			}
+163				
+164		}while(chk != 0 && pass != 5);
+165			
+166		wait_ms(10);
+167		chk = SHT3X.read(adr<<1, data, 6, false);
+168
+169		//spajanje MSB i LSB te sluzbene formule za tumacenje vrijednosti
+170		temp=(-45+175*(data[0]<<8 | data[1])/65535); 
+171		hum=(100*(data[3]<<8 | data[4])/65535);
+172
+173		//pc.printf("temp: %d °C\n\r", temp);
+174		//pc.printf("hum: %d %%\n\r", hum);
+175		//pc.printf("\n\r");
+176	}
+177
+178	//dohvacanje podataka s ESP32
+179	void SPI_receive(){
+180		char data_in[16]; //spremnik za prihvat svih dolaznih podataka
+181		int place=0; //pomocna varijabla
+182		
+183		//dobivamo sve podatke s ESP32 i spremamo ih 
+184		for(int i=0; i<15; i++){
+185			data_in[i] = spi_port.read(); //primljeni podatak
+186		}
+187		
+188		//podaci temp_morn, temp_day, temp_eve sadrze 1 bajt (8 bitova) podataka te se oni prvi odvajaju iz spremnika dolaznih podataka
+189		for(place=0; place<3; place++){
+190			SPI_array[place] = data_in[place];
+191		}
+192		
+193		//podaci weather_id, Alarm_EPOCH, Time_EPOCH sadrze 4 bajt-a (32 bita) podataka te trebaju drugaciju obradu od prethodnih podataka
+194		for(int i=3; i<6; i++){
+195			//pomicanje i spajanje dijelova podatka
+196			SPI_array[i] = (long)data_in[place] | (long)data_in[place+1]<<8 | (long)data_in[place+2]<<16 | (long)data_in[place+3]<<24;
+197			place = (place + 4); //vodenje racuna o poziciji unutar spremnika za prihvat ulaznih podataka
+198		}
+199		
+200		set_time(SPI_array[5]); //sinkronizacija unutarnjeg (NUCLEO) RTC-a s pristiglim podatkom
+201		EPOCH_and_ALARM(); //separacija vremenskog stringa u zasebne varijable
+202		
+203		info = 1; //micanje teksta "No information" s LCD-a
+204		
+205		lcd.cls();
+206		display_main(); //inicijalno postavljanje podataka na LCD
+207		update_date(); //inicijalno postavljanje datuma na LCD
+208		
+209		
+210	}
+211
+212	//LCD16x2
+213	int prognoza(){
+214		//branchless programing
+215		return 0+1*(SPI_array[3] >= 200 && SPI_array[3] <= 232)+
+216		2*(SPI_array[3] >= 300 && SPI_array[3] <= 321)+
+217		3*(SPI_array[3] >= 500 && SPI_array[3] <= 531)+
+218		4*(SPI_array[3] >= 600 && SPI_array[3] <= 622)+
+219		5*(SPI_array[3] == 701)+
+220		6*(SPI_array[3] == 711)+
+221		7*(SPI_array[3] == 721)+
+222		8*(SPI_array[3] == 731)+
+223		9*(SPI_array[3] == 741)+
+224		10*(SPI_array[3] == 751)+
+225		11*(SPI_array[3] == 761)+
+226		12*(SPI_array[3] == 762)+
+227		13*(SPI_array[3] == 771)+
+228		14*(SPI_array[3] == 781)+
+229		15*(SPI_array[3] == 800)+
+230		16*(SPI_array[3] >= 801 && SPI_array[3] <= 804);
+231	}
+232
+233	//napravljeno kao zasebna funkcija da ne troši procesorsko vrijeme jer se rijetko mijenja
+234	void update_date(void){
+235		lcd.locate(0,0); //pozicioniranje na LCD-u, (stupci, redovi)
+236		lcd.printf("%.2d/%.2d/%.2d", day, month, year);
+237	}
+238
+239	int looping=0; //pomocna varijabla koja omogucuje izmjenu temperaturnih prognoza
+240	void display_main(){
+241		looping++;
+242		if(looping==3){
+243			looping=0;
+244		}
+245		
+246		trg = !trg; //pomocna varijabla za izmjenu izmedu Tin i Hin
+247		
+248		if(!trg){
+249			lcd.locate(9,0);
+250			lcd.printf("Tin:%.2d%c", temp, stupnjevi);
+251			
+252			lcd.locate(0,1); //prelazimo u sljedeci red
+253			if(info){ //ako je bio obavljen prijenos podataka s ESP32
+254				lcd.printf("%s:%.2d%c  ", day_state[looping], SPI_array[looping], stupnjevi);
+255				
+256				lcd.locate(9,1);
+257				lcd.printf("%s", arr[prognoza()]);
+258			}else{//ako nije bio obavljen prijenos podataka s ESP32
+259				lcd.printf(" No information ");
+260			}
+261			
+262		}else{
+263			SHT30(); //dohvacanje nove temperature i vlaznosti s senzora
+264			lcd.locate(9,0);
+265			lcd.printf("Hin:%.2d%%", hum);
+266			
+267		}
+268	}
+269
+270	int main(){
+271		spi_port.format(8,0); //SPI -> 8 bitni podatak, mod rada 0
+272		spi_port.frequency(1125000); // brzina SPI komunikacije
+273		
+274		i2c_lcd.frequency(400000); //Fast-mode da bi se skratio treptaj numeriskoga ekrana
+275		SHT3X.frequency(400000);
+276		
+277		EPOCH_and_ALARM(); //refresh podataka za vrijeme
+278		
+279		//LCD16x2
+280		lcd.setCursor(TextLCD::CurOff_BlkOff);
+281		lcd.setBacklight(TextLCD::LightOn);
+282		
+283		display_main(); //inicijalno postavljanje podataka na LCD
+284		update_date(); //inicijalno postavljanje datuma
+285		
+286		while(1){
+287			if(spi_port.receive()){ //provjera stanja SPI SS linije
+288				SPI_receive();
+289			}else{
+290				urica();
+291				
+292				if(second == 0 && minute == 0 && hour == 0){ //refresh datuma u ponoc
+293					update_date();
+294				}
+295			}//else 
+296		}//while(1)
+297	}//int main()
